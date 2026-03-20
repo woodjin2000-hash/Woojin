@@ -15,7 +15,6 @@ def _unique_keep_order(seq: Sequence[str]) -> List[str]:
     return out
 
 
-# 현재 네 raw baseline 그대로
 FS_CORE_DYNAMIC = list(CONFIG["dynamic_vars"])
 FS_CORE_STATIC = list(CONFIG["static_vars"])
 
