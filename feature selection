@@ -1,0 +1,436 @@
+# 12. FAST FINISH FEATURE SELECTION (RAW LSTM ONLY)
+
+MERGED_NC_PATH = r"C:\Users\com\Desktop\Woojin\Hydraulic lab\Master process\South Korea prediction\LSTM\master_feature_selection_1976_2024_145cells_merged_final.nc"
+
+
+# 12-1. BASE / ALL-FEATURES / SHORTLISTS
+
+def _unique_keep_order(seq: Sequence[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+
+# 현재 네 raw baseline 그대로
+FS_CORE_DYNAMIC = list(CONFIG["dynamic_vars"])
+FS_CORE_STATIC = list(CONFIG["static_vars"])
+
+# "feature selection 안 한 값"과 비교할 curated all-features
+FS_ALL_DYNAMIC = _unique_keep_order([
+    "SC_PDSI_final",
+    "P_mm_month",
+    "PET_PM_mm_month",
+    "T_C",
+    "RH_pct",
+    "u10",
+    "v10",
+    "Rn_MJ_m2_day",
+    "H500_m",
+    "H300_m", "u300", "v300",
+    "pdo", "nino34_anom", "dmi", "ao", "nao", "pna", "soi",
+    "soil_moisture_layer1_m3m3",
+    "soil_moisture_layer2_m3m3",
+    "soil_moisture_layer3_m3m3",
+    "soil_moisture_layer4_m3m3",
+    "soil_moisture_rootzone_m3m3",
+    "soil_moisture_total_m3m3",
+    "soil_water_rootzone_mm",
+    "soil_water_total_mm",
+    "runoff_m",
+    "subsurface_runoff_m",
+    "snow_depth_m",
+    "snow_depth_water_equiv_m",
+    "snowfall_mwe_m",
+    "snowmelt_mwe_m",
+])
+
+FS_ALL_STATIC = _unique_keep_order([
+    "cell_lat", "cell_lon", "elev_m",
+    "AWC_total_mm", "AWC_surface_mm", "AWC_underlying_mm",
+])
+
+FS_SHORTLIST_BY_LEAD = {
+    1: {
+        "dynamic": [],
+        "static": ["AWC_total_mm", "AWC_surface_mm"],
+        "max_k": 2,
+    },
+    3: {
+        "dynamic": [
+            "soil_moisture_layer2_m3m3",
+            "runoff_m",
+            "snow_depth_water_equiv_m",
+        ],
+        "static": ["AWC_total_mm"],
+        "max_k": 2,
+    },
+    6: {
+        "dynamic": [
+            "soil_moisture_rootzone_m3m3",
+            "snow_depth_water_equiv_m",
+            "snowmelt_mwe_m",
+        ],
+        "static": [],
+        "max_k": 2,
+    },
+    9: {
+        "dynamic": [
+            "runoff_m",
+            "soil_moisture_rootzone_m3m3",
+            "snow_depth_water_equiv_m",
+        ],
+        "static": [],
+        "max_k": 2,
+    },
+    12: {
+        "dynamic": [
+            "H300_m",
+            "u300",
+            "v300",
+        ],
+        "static": [
+            "AWC_total_mm",
+        ],
+        "max_k": 2,
+    },
+    18: {
+        "dynamic": [],
+        "static": [],
+        "max_k": 0,
+    },
+    24: {
+        "dynamic": [
+            "H300_m",
+            "u300",
+            "soil_moisture_total_m3m3",
+            "soil_water_total_mm",
+        ],
+        "static": [],
+        "max_k": 2,
+    },
+}
+
+
+
+# 12-2. CONFIG BUILDERS
+
+
+def _make_fs_cfg_core(base_cfg: Dict, lead: int, exp_name: str) -> Dict:
+    cfg = copy.deepcopy(base_cfg)
+    cfg["nc_path"] = MERGED_NC_PATH
+    cfg["extra_nc_paths"] = []
+    cfg["leads"] = [int(lead)]
+    cfg["dynamic_vars"] = list(FS_CORE_DYNAMIC)
+    cfg["static_vars"] = list(FS_CORE_STATIC)
+    cfg["allow_short_history"] = False
+    cfg["lookback"] = 230
+    cfg["decoder_time_features"] = False
+    cfg["target_mode"] = "absolute"
+
+    if FS_FAST_MODE:
+        cfg["max_epochs"] = FS_FAST_MAX_EPOCHS
+        cfg["patience"] = FS_FAST_PATIENCE
+        cfg["hidden_size"] = FS_FAST_HIDDEN
+
+    root_parent = Path(base_cfg["out_dir"]).parent
+    cfg["out_dir"] = str(root_parent / "FEATURE_SELECTION" / "finish_today" / exp_name)
+    return cfg
+
+
+def _make_fs_cfg_all(base_cfg: Dict, lead: int, exp_name: str) -> Dict:
+    cfg = copy.deepcopy(base_cfg)
+    cfg["nc_path"] = MERGED_NC_PATH
+    cfg["extra_nc_paths"] = []
+    cfg["leads"] = [int(lead)]
+    cfg["dynamic_vars"] = list(FS_ALL_DYNAMIC)
+    cfg["static_vars"] = list(FS_ALL_STATIC)
+    cfg["allow_short_history"] = False
+    cfg["lookback"] = 230
+    cfg["decoder_time_features"] = False
+    cfg["target_mode"] = "absolute"
+
+    if FS_FAST_MODE:
+        cfg["max_epochs"] = FS_FAST_MAX_EPOCHS
+        cfg["patience"] = FS_FAST_PATIENCE
+        cfg["hidden_size"] = FS_FAST_HIDDEN
+
+    root_parent = Path(base_cfg["out_dir"]).parent
+    cfg["out_dir"] = str(root_parent / "FEATURE_SELECTION" / "finish_today" / exp_name)
+    return cfg
+
+
+def _make_fs_cfg_subset(
+    base_cfg: Dict,
+    lead: int,
+    exp_name: str,
+    add_dynamic: List[str],
+    add_static: List[str],
+) -> Dict:
+    cfg = copy.deepcopy(base_cfg)
+    cfg["nc_path"] = MERGED_NC_PATH
+    cfg["extra_nc_paths"] = []
+    cfg["leads"] = [int(lead)]
+    cfg["dynamic_vars"] = _unique_keep_order(list(FS_CORE_DYNAMIC) + list(add_dynamic))
+    cfg["static_vars"] = _unique_keep_order(list(FS_CORE_STATIC) + list(add_static))
+    cfg["allow_short_history"] = False
+    cfg["lookback"] = 230
+    cfg["decoder_time_features"] = False
+    cfg["target_mode"] = "absolute"
+
+    if FS_FAST_MODE:
+        cfg["max_epochs"] = FS_FAST_MAX_EPOCHS
+        cfg["patience"] = FS_FAST_PATIENCE
+        cfg["hidden_size"] = FS_FAST_HIDDEN
+
+    root_parent = Path(base_cfg["out_dir"]).parent
+    cfg["out_dir"] = str(root_parent / "FEATURE_SELECTION" / "finish_today" / exp_name)
+    return cfg
+
+
+
+def _generate_shortlist_combos(lead: int) -> List[Tuple[List[str], List[str]]]:
+    info = FS_SHORTLIST_BY_LEAD[int(lead)]
+    dyn = list(info["dynamic"])
+    sta = list(info["static"])
+    max_k = int(info["max_k"])
+
+    items = [("dynamic", v) for v in dyn] + [("static", v) for v in sta]
+
+    combos = []
+    if max_k <= 0 or len(items) == 0:
+        return combos
+
+    for k in range(1, min(max_k, len(items)) + 1):
+        for subset in combinations(items, k):
+            add_dyn = [v for kind, v in subset if kind == "dynamic"]
+            add_sta = [v for kind, v in subset if kind == "static"]
+            combos.append((add_dyn, add_sta))
+
+    return combos
+
+
+def build_finish_today_fs_plan(
+    target_leads: Sequence[int] = (1, 3, 6, 9, 12, 18, 24),
+    include_all_features: bool = True,
+) -> Tuple[List[Dict], pd.DataFrame]:
+    plan = []
+    manifest_rows = []
+
+    for lead in target_leads:
+        lead = int(lead)
+        prefix = f"L{lead:02d}"
+
+        # core
+        exp_name = f"{prefix}_000_CORE"
+        cfg = _make_fs_cfg_core(CONFIG, lead, exp_name)
+        plan.append(cfg)
+        manifest_rows.append({
+            "experiment": exp_name,
+            "lead": lead,
+            "mode": "CORE",
+            "n_added_dynamic": 0,
+            "n_added_static": 0,
+            "added_dynamic": "",
+            "added_static": "",
+        })
+
+        # all-features
+        if include_all_features:
+            exp_name = f"{prefix}_999_ALL"
+            cfg = _make_fs_cfg_all(CONFIG, lead, exp_name)
+            plan.append(cfg)
+            manifest_rows.append({
+                "experiment": exp_name,
+                "lead": lead,
+                "mode": "ALL_FEATURES",
+                "n_added_dynamic": len(FS_ALL_DYNAMIC) - len(FS_CORE_DYNAMIC),
+                "n_added_static": len(FS_ALL_STATIC) - len(FS_CORE_STATIC),
+                "added_dynamic": ",".join([v for v in FS_ALL_DYNAMIC if v not in FS_CORE_DYNAMIC]),
+                "added_static": ",".join([v for v in FS_ALL_STATIC if v not in FS_CORE_STATIC]),
+            })
+
+        # shortlisted combos
+        combos = _generate_shortlist_combos(lead)
+        for idx, (add_dyn, add_sta) in enumerate(combos, start=1):
+            exp_name = f"{prefix}_{idx:03d}_SUBSET"
+            cfg = _make_fs_cfg_subset(
+                CONFIG,
+                lead=lead,
+                exp_name=exp_name,
+                add_dynamic=add_dyn,
+                add_static=add_sta,
+            )
+            plan.append(cfg)
+            manifest_rows.append({
+                "experiment": exp_name,
+                "lead": lead,
+                "mode": "SUBSET",
+                "n_added_dynamic": len(add_dyn),
+                "n_added_static": len(add_sta),
+                "added_dynamic": ",".join(add_dyn),
+                "added_static": ",".join(add_sta),
+            })
+
+    manifest_df = pd.DataFrame(manifest_rows)
+    return plan, manifest_df
+
+
+def validate_finish_today_plan(plan: List[Dict]) -> List[Dict]:
+    ds = xr.open_dataset(MERGED_NC_PATH)
+    available_vars = set(ds.data_vars.keys()) | set(ds.variables.keys())
+
+    valid_plan = []
+    for cfg in plan:
+        missing_dyn = [v for v in cfg["dynamic_vars"] if v not in available_vars]
+        missing_sta = [
+            v for v in cfg["static_vars"]
+            if v not in available_vars and v not in ["cell_lat", "cell_lon", "lat", "lon", "latitude", "longitude"]
+        ]
+
+        if missing_dyn or missing_sta:
+            print(f"[SKIP] {cfg['out_dir']}")
+            print(f"  missing dynamic: {missing_dyn}")
+            print(f"  missing static : {missing_sta}")
+            continue
+
+        valid_plan.append(cfg)
+
+    ds.close()
+    return valid_plan
+
+
+
+def run_finish_today_fs(
+    target_leads: Sequence[int] = (1, 3, 6, 9, 12, 18, 24),
+    include_all_features: bool = True,
+) -> None:
+    plan, manifest_df = build_finish_today_fs_plan(
+        target_leads=target_leads,
+        include_all_features=include_all_features,
+    )
+    plan = validate_finish_today_plan(plan)
+
+    fs_root = Path(CONFIG["out_dir"]).parent / "FEATURE_SELECTION" / "finish_today"
+    fs_root.mkdir(parents=True, exist_ok=True)
+    manifest_df.to_csv(fs_root / "finish_today_manifest.csv", index=False)
+
+    print("\n==========================================")
+    print(f"[INFO] Finish-today FS experiments: {len(plan)}")
+    print("==========================================\n")
+
+    for i, cfg in enumerate(plan, start=1):
+        exp_name = Path(cfg["out_dir"]).name
+        print(f"\n[{i}/{len(plan)}] Running {exp_name}")
+        print(f"  lead        : {cfg['leads']}")
+        print(f"  n_dynamic   : {len(cfg['dynamic_vars'])}")
+        print(f"  n_static    : {len(cfg['static_vars'])}")
+        run_all_leads_experiment(cfg)
+
+
+def collect_finish_today_results(fs_root_dir: Path) -> pd.DataFrame:
+    rows = []
+
+    manifest_path = fs_root_dir / "finish_today_manifest.csv"
+    manifest_df = pd.read_csv(manifest_path) if manifest_path.exists() else None
+
+    for exp_dir in sorted([p for p in fs_root_dir.iterdir() if p.is_dir()]):
+        lead_dirs = [p for p in exp_dir.iterdir() if p.is_dir() and p.name.startswith("lead_")]
+        for lead_dir in lead_dirs:
+            lead = int(lead_dir.name.split("_")[1])
+
+            summary_path = lead_dir / "split_grid_distribution_summary.csv"
+            grid_path = lead_dir / "grid_metrics_all_splits_hlast.csv"
+            overall_path = lead_dir / "overall_metrics_hlast.csv"
+
+            if not (summary_path.exists() and grid_path.exists() and overall_path.exists()):
+                continue
+
+            summary_df = pd.read_csv(summary_path)
+            grid_df = pd.read_csv(grid_path)
+            overall_df = pd.read_csv(overall_path)
+
+            for split_name in ["val", "test"]:
+                row = {
+                    "experiment": exp_dir.name,
+                    "lead": lead,
+                    "split": split_name,
+                }
+
+                if manifest_df is not None:
+                    mm = manifest_df[(manifest_df["experiment"] == exp_dir.name) & (manifest_df["lead"] == lead)]
+                    if len(mm) > 0:
+                        row["mode"] = mm["mode"].iloc[0]
+                        row["n_added_dynamic"] = int(mm["n_added_dynamic"].iloc[0])
+                        row["n_added_static"] = int(mm["n_added_static"].iloc[0])
+                        row["added_dynamic"] = mm["added_dynamic"].iloc[0]
+                        row["added_static"] = mm["added_static"].iloc[0]
+
+                df_r2 = summary_df[(summary_df["split"] == split_name) & (summary_df["metric"] == "r2")]
+                if len(df_r2) > 0:
+                    row["grid_r2_mean"] = float(df_r2["mean"].iloc[0])
+                    row["grid_r2_median"] = float(df_r2["median"].iloc[0])
+                    row["grid_r2_q1"] = float(df_r2["q1"].iloc[0])
+                    row["grid_r2_q3"] = float(df_r2["q3"].iloc[0])
+
+                df_split = grid_df[grid_df["split"] == split_name].copy()
+                if len(df_split) > 0:
+                    row["positive_grid_ratio"] = float((df_split["r2"] > 0).mean())
+
+                ov = overall_df[overall_df["split"] == split_name].copy()
+                if len(ov) > 0:
+                    row["pooled_r2"] = float(ov["pooled_r2"].iloc[0])
+                    row["rmse"] = float(ov["rmse"].iloc[0])
+                    row["mae"] = float(ov["mae"].iloc[0])
+
+                rows.append(row)
+
+    out = pd.DataFrame(rows)
+    if len(out) == 0:
+        return out
+
+    return out.sort_values(
+        ["lead", "split", "grid_r2_median", "positive_grid_ratio", "pooled_r2"],
+        ascending=[True, True, False, False, False]
+    ).reset_index(drop=True)
+
+
+def rank_finish_today_winners(results_df: pd.DataFrame) -> pd.DataFrame:
+    if len(results_df) == 0:
+        return results_df
+
+    val_df = results_df[results_df["split"] == "val"].copy()
+
+    # tie-break:
+    # 1) val grid_r2_median
+    # 2) val positive_grid_ratio
+    # 3) val pooled_r2
+    # 4) fewer added vars
+    val_df["n_added_total"] = val_df.get("n_added_dynamic", 0).fillna(0) + val_df.get("n_added_static", 0).fillna(0)
+
+    ranked = val_df.sort_values(
+        ["lead", "grid_r2_median", "positive_grid_ratio", "pooled_r2", "n_added_total"],
+        ascending=[True, False, False, False, True]
+    ).groupby("lead", as_index=False).head(5)
+
+    return ranked.reset_index(drop=True)
+if __name__ == "__main__":
+    run_finish_today_fs(
+        target_leads=[1, 3, 6, 9, 12, 18, 24],
+        include_all_features=True,
+    )
+
+    fs_root = Path(CONFIG["out_dir"]).parent / "FEATURE_SELECTION" / "finish_today"
+    results = collect_finish_today_results(fs_root)
+    results.to_csv(fs_root / "finish_today_results.csv", index=False)
+
+    winners = rank_finish_today_winners(results)
+    winners.to_csv(fs_root / "finish_today_top5_by_lead.csv", index=False)
+
+    print("\n===== ALL RESULTS =====")
+    print(results)
+    print("\n===== TOP-5 BY LEAD (VAL-BASED) =====")
+    print(winners)
