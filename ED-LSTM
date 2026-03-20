@@ -1,0 +1,1819 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import copy
+import json
+import math
+import os
+import random
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import xarray as xr
+import matplotlib.pyplot as plt
+
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pack_padded_sequence
+
+
+
+# 1. USER CONFIG
+
+
+CONFIG = {
+    "nc_path": r"C:\Users\com\Desktop\Woojin\Hydraulic lab\Master process\South Korea prediction\master_feature_selection_1976_2024_145cells.nc",
+    "extra_nc_paths": [],
+    "out_dir": r"C:\Users\com\Desktop\Woojin\Hydraulic lab\Master process\South Korea prediction\LSTM\EDLSTM_clean_protocol_lb230_230(4)",
+
+    "target_var": "SC_PDSI_final",
+    "lookback": 230,
+    "leads": [1,3,6],
+    "target_mode": "absolute",  
+
+ 
+    "allow_short_history": False,
+    "encoder_pad_value": 0.0, 
+
+    "selection_split": {
+        "train_start": "1976-01-01",
+        "train_end":   "2006-12-01",
+        "val_start":   "2007-01-01",
+        "val_end":     "2012-12-01",
+        "test_start":  "2019-01-01",
+        "test_end":    "2024-12-01",
+    },
+
+    "report_split": {
+        "train_start": "1976-01-01",
+        "train_end":   "2012-12-01",
+        "val_start":   "2013-01-01",
+        "val_end":     "2018-12-01",
+        "test_start":  "2019-01-01",
+        "test_end":    "2024-12-01",
+    },
+
+    "loss_mode": "linear_hlast_weighted",  
+    "min_target_time": None,
+
+    "dynamic_vars": [
+        "SC_PDSI_final",
+        "P_mm_month",
+        "PET_PM_mm_month",
+        "T_C",
+        "RH_pct",
+        "u10",
+        "v10",
+        "Rn_MJ_m2_day",
+        "H500_m",
+        "pdo",
+        "nino34_anom",
+        "dmi",
+    ],
+
+
+    "decoder_future_vars": [],
+    "decoder_time_features": False,
+
+    "static_vars": ["cell_lat", "cell_lon", "elev_m"],
+    "append_static_to_encoder": True,
+
+    "auto_add_derived_features": True,
+    "derived_feature_flags": {
+        "aridity_p_over_pet": True,
+        "dryness_pet_over_p": True,
+        "winter_precip_sum_3m": True,
+        "snow_ratio_proxy": True,
+        "snow_precip_proxy": True,
+        "rolling_p_3": True,
+        "rolling_p_6": True,
+        "rolling_p_12": True,
+        "rolling_ai_3": True,
+        "rolling_ai_6": True,
+        "rolling_ai_12": True,
+    },
+    "snow_temp_threshold_low_c": 0.0,
+    "snow_temp_threshold_high_c": 2.0,
+
+    # scaling
+    "scale_dynamic": True,
+    "scale_target": True,
+
+    # model
+    "hidden_size": 128,
+    "num_layers": 1,
+    "lstm_dropout": 0.0,          # num_layers>1일 때만 LSTM 내부 dropout 의미 있음
+    "encoder_input_dropout": 0.05,
+    "decoder_input_dropout": 0.05,
+    "head_dropout": 0.05,
+
+    # optimization
+    "batch_size": 256,
+    "lr": 1e-3,
+    "weight_decay": 1e-5,
+    "max_epochs": 60,
+    "patience": 10,
+    "max_grad_norm": 1.0,
+
+    # teacher forcing
+    "tf_start": 0.0,
+    "tf_end": 0.0,
+
+    # scheduler
+    "scheduler_factor": 0.5,
+    "scheduler_patience": 3,
+    "min_lr": 1e-5,
+
+    # baselines
+    "baseline_ridge_alpha": 1.0,
+
+    # save options
+    "save_maps_for_splits": ["val", "test"],
+
+    "device": "auto",
+    "seed": 42,
+}
+
+
+
+# 2. UTILS / DATACLASSES
+
+
+def seed_everything(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def get_device(device_arg: str) -> torch.device:
+    if device_arg == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device_arg)
+
+
+@dataclass
+class SplitConfig:
+    train_start: str = "1976-01-01"
+    train_end: str = "2012-12-01"
+    val_start: str = "2013-01-01"
+    val_end: str = "2018-12-01"
+    test_start: str = "2019-01-01"
+    test_end: str = "2024-12-01"
+
+
+@dataclass
+class PreparedData:
+    train: "WindowDataset"
+    val: "WindowDataset"
+    test: "WindowDataset"
+    target_scaler: "PerCellTargetScaler"
+    dynamic_feature_names: List[str]
+    decoder_feature_names: List[str]
+    target_var: str
+    target_col_idx: int
+    time_values: np.ndarray
+    cell_values: np.ndarray
+    cell_lat: np.ndarray
+    cell_lon: np.ndarray
+    lookback: int
+    horizon: int
+    split_window_info: Dict[str, Dict]
+
+
+
+# 3. DATASET / SCALER
+
+
+class WindowDataset(Dataset):
+    """
+    encoder_x:       [N, L_enc, F_enc]   (right-padded if allow_short_history=True)
+    encoder_len:     [N]
+    decoder_x:       [N, H, F_dec]
+    decoder_y:       [N, H, 1]
+    last_obs_y:      [N, 1]             (decoder initial prev_y)
+    target_hist_lp:  [N, L_enc]         (left-padded target history for baselines)
+    cell_id:         [N]
+    target_start_idx:[N]
+    """
+    def __init__(
+        self,
+        encoder_x: torch.Tensor,
+        encoder_len: torch.Tensor,
+        decoder_x: torch.Tensor,
+        decoder_y: torch.Tensor,
+        last_obs_y: torch.Tensor,
+        target_hist_lp: torch.Tensor,
+        cell_id: torch.Tensor,
+        target_start_idx: torch.Tensor,
+    ) -> None:
+        assert encoder_x.ndim == 3
+        assert encoder_len.ndim == 1
+        assert decoder_x.ndim == 3
+        assert decoder_y.ndim == 3 and decoder_y.size(-1) == 1
+        assert last_obs_y.ndim == 2 and last_obs_y.size(-1) == 1
+        assert target_hist_lp.ndim == 2
+        assert cell_id.ndim == 1
+        assert target_start_idx.ndim == 1
+
+        n = encoder_x.size(0)
+        assert encoder_len.size(0) == n
+        assert decoder_x.size(0) == n
+        assert decoder_y.size(0) == n
+        assert last_obs_y.size(0) == n
+        assert target_hist_lp.size(0) == n
+        assert cell_id.size(0) == n
+        assert target_start_idx.size(0) == n
+
+        self.encoder_x = encoder_x.float()
+        self.encoder_len = encoder_len.long()
+        self.decoder_x = decoder_x.float()
+        self.decoder_y = decoder_y.float()
+        self.last_obs_y = last_obs_y.float()
+        self.target_hist_lp = target_hist_lp.float()
+        self.cell_id = cell_id.long()
+        self.target_start_idx = target_start_idx.long()
+
+    def __len__(self) -> int:
+        return self.encoder_x.size(0)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return {
+            "encoder_x": self.encoder_x[idx],
+            "encoder_len": self.encoder_len[idx],
+            "decoder_x": self.decoder_x[idx],
+            "decoder_y": self.decoder_y[idx],
+            "last_obs_y": self.last_obs_y[idx],
+            "target_hist_lp": self.target_hist_lp[idx],
+            "cell_id": self.cell_id[idx],
+            "target_start_idx": self.target_start_idx[idx],
+        }
+
+
+class PerCellStandardScaler:
+    def __init__(self, eps: float = 1e-6) -> None:
+        self.eps = eps
+        self.mean_: Optional[np.ndarray] = None
+        self.std_: Optional[np.ndarray] = None
+
+    def fit(self, x_tcf: np.ndarray, train_time_mask: np.ndarray) -> None:
+        train_x = x_tcf[train_time_mask]  # [T_train, C, F]
+        self.mean_ = np.nanmean(train_x, axis=0)
+        self.std_ = np.nanstd(train_x, axis=0)
+        self.std_[self.std_ < self.eps] = 1.0
+
+    def transform(self, x_tcf: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("PerCellStandardScaler is not fitted.")
+        return (x_tcf - self.mean_[None, :, :]) / self.std_[None, :, :]
+
+
+class PerCellTargetScaler:
+    def __init__(self, eps: float = 1e-6) -> None:
+        self.eps = eps
+        self.mean_: Optional[np.ndarray] = None
+        self.std_: Optional[np.ndarray] = None
+
+    def fit(self, y_tc: np.ndarray, train_time_mask: np.ndarray) -> None:
+        train_y = y_tc[train_time_mask]
+        self.mean_ = np.nanmean(train_y, axis=0)
+        self.std_ = np.nanstd(train_y, axis=0)
+        self.std_[self.std_ < self.eps] = 1.0
+
+    def transform(self, y_tc: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("PerCellTargetScaler is not fitted.")
+        return (y_tc - self.mean_[None, :]) / self.std_[None, :]
+
+    def inverse_transform_batch_torch(self, y_nh1: torch.Tensor, cell_id_n: torch.Tensor) -> torch.Tensor:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("PerCellTargetScaler is not fitted.")
+        mean = torch.as_tensor(self.mean_, dtype=y_nh1.dtype, device=y_nh1.device)[cell_id_n].view(-1, 1, 1)
+        std = torch.as_tensor(self.std_, dtype=y_nh1.dtype, device=y_nh1.device)[cell_id_n].view(-1, 1, 1)
+        return y_nh1 * std + mean
+
+
+class StaticFeatureScaler:
+    def __init__(self, eps: float = 1e-6) -> None:
+        self.eps = eps
+        self.mean_: Optional[np.ndarray] = None
+        self.std_: Optional[np.ndarray] = None
+
+    def fit(self, x_cf: np.ndarray) -> None:
+        self.mean_ = np.nanmean(x_cf, axis=0)
+        self.std_ = np.nanstd(x_cf, axis=0)
+        self.std_[self.std_ < self.eps] = 1.0
+
+    def transform(self, x_cf: np.ndarray) -> np.ndarray:
+        if self.mean_ is None or self.std_ is None:
+            raise RuntimeError("StaticFeatureScaler is not fitted.")
+        return (x_cf - self.mean_[None, :]) / self.std_[None, :]
+
+
+# 4. DATA LOADING / FEATURE ENGINEERING
+
+
+def _require_vars(ds: xr.Dataset, var_names: Sequence[str]) -> None:
+    missing = [v for v in var_names if v not in ds.data_vars]
+    if missing:
+        raise KeyError(f"Variables not found in dataset: {missing}")
+
+
+def open_and_merge_datasets(main_path: str, extra_paths: Sequence[str]) -> xr.Dataset:
+    ds = xr.open_dataset(main_path)
+    for p in extra_paths:
+        extra = xr.open_dataset(p)
+        ds = xr.merge([ds, extra], compat="no_conflicts", join="exact")
+    return ds
+
+
+def _get_coord_var(ds: xr.Dataset, candidates: Sequence[str]) -> str:
+    for name in candidates:
+        if name in ds.variables:
+            return name
+    raise KeyError(f"None of coordinate candidates were found: {candidates}")
+
+
+def _read_cell_coord(ds: xr.Dataset, candidates: Sequence[str]) -> np.ndarray:
+    name = _get_coord_var(ds, candidates)
+    da = ds[name]
+    if da.ndim == 1 and da.dims == ("cell",):
+        return da.values.astype(np.float32)
+
+    if set(da.dims) == {"time", "cell"}:
+        arr = da.transpose("time", "cell").values.astype(np.float32)
+        first = arr[0]
+        if not np.allclose(arr, first[None, :], equal_nan=True):
+            raise ValueError(f"Coordinate {name} varies over time.")
+        return first
+
+    raise ValueError(f"Unsupported coordinate dims for {name}: {da.dims}")
+
+
+def maybe_add_derived_features(ds: xr.Dataset, cfg: Dict) -> xr.Dataset:
+    if not cfg["auto_add_derived_features"]:
+        return ds
+
+    flags = cfg["derived_feature_flags"]
+    low = float(cfg["snow_temp_threshold_low_c"])
+    high = float(cfg["snow_temp_threshold_high_c"])
+
+    if flags.get("aridity_p_over_pet", False) and "P_mm_month" in ds and "PET_PM_mm_month" in ds:
+        ds["AI_p_over_pet"] = ds["P_mm_month"] / xr.where(np.abs(ds["PET_PM_mm_month"]) < 1e-6, 1e-6, ds["PET_PM_mm_month"])
+
+    if flags.get("dryness_pet_over_p", False) and "P_mm_month" in ds and "PET_PM_mm_month" in ds:
+        ds["DI_pet_over_p"] = ds["PET_PM_mm_month"] / xr.where(np.abs(ds["P_mm_month"]) < 1e-6, 1e-6, ds["P_mm_month"])
+
+    if "P_mm_month" in ds:
+        if flags.get("rolling_p_3", False):
+            ds["P_roll3"] = ds["P_mm_month"].rolling(time=3, min_periods=3).sum()
+        if flags.get("rolling_p_6", False):
+            ds["P_roll6"] = ds["P_mm_month"].rolling(time=6, min_periods=6).sum()
+        if flags.get("rolling_p_12", False):
+            ds["P_roll12"] = ds["P_mm_month"].rolling(time=12, min_periods=12).sum()
+
+    if "P_mm_month" in ds and "PET_PM_mm_month" in ds:
+        p3 = ds["P_mm_month"].rolling(time=3, min_periods=3).sum()
+        p6 = ds["P_mm_month"].rolling(time=6, min_periods=6).sum()
+        p12 = ds["P_mm_month"].rolling(time=12, min_periods=12).sum()
+
+        pet3 = ds["PET_PM_mm_month"].rolling(time=3, min_periods=3).sum()
+        pet6 = ds["PET_PM_mm_month"].rolling(time=6, min_periods=6).sum()
+        pet12 = ds["PET_PM_mm_month"].rolling(time=12, min_periods=12).sum()
+
+        if flags.get("rolling_ai_3", False):
+            ds["AI_roll3"] = p3 / xr.where(np.abs(pet3) < 1e-6, 1e-6, pet3)
+        if flags.get("rolling_ai_6", False):
+            ds["AI_roll6"] = p6 / xr.where(np.abs(pet6) < 1e-6, 1e-6, pet6)
+        if flags.get("rolling_ai_12", False):
+            ds["AI_roll12"] = p12 / xr.where(np.abs(pet12) < 1e-6, 1e-6, pet12)
+
+    if flags.get("winter_precip_sum_3m", False) and "P_mm_month" in ds:
+        p_da = ds["P_mm_month"].transpose("time", "cell")
+        p = p_da.values.astype(np.float32)
+        time_index = pd.to_datetime(ds["time"].values)
+
+        months = time_index.month.values
+        years = time_index.year.values
+        winter_year = np.where(months == 12, years + 1, years)
+
+        out = np.full_like(p, np.nan, dtype=np.float32)
+        unique_wy = np.unique(winter_year)
+
+        for wy in unique_wy:
+            idx = np.where(
+                ((months == 12) & (years + 1 == wy)) |
+                ((months == 1) & (years == wy)) |
+                ((months == 2) & (years == wy))
+            )[0]
+            if len(idx) > 0:
+                s = np.nansum(p[idx], axis=0)
+                out[idx, :] = s[None, :]
+
+        ds["winter_precip_sum"] = xr.DataArray(
+            out,
+            coords={"time": p_da["time"], "cell": p_da["cell"]},
+            dims=("time", "cell"),
+        )
+
+        w = ds["winter_precip_sum"].transpose("time", "cell").values.astype(np.float32)
+        for c in range(w.shape[1]):
+            w[:, c] = pd.Series(w[:, c]).ffill().values
+
+        ds["winter_precip_sum"] = xr.DataArray(
+            w,
+            coords={"time": p_da["time"], "cell": p_da["cell"]},
+            dims=("time", "cell"),
+        )
+
+    if "T_C" in ds:
+        t = ds["T_C"]
+        snow_ratio = xr.where(t <= low, 1.0, xr.where(t >= high, 0.0, (high - t) / max(high - low, 1e-6)))
+
+        if flags.get("snow_ratio_proxy", False):
+            ds["snow_ratio_proxy"] = snow_ratio
+
+        if flags.get("snow_precip_proxy", False) and "P_mm_month" in ds:
+            ds["snow_precip_proxy"] = ds["P_mm_month"] * snow_ratio
+
+    return ds
+
+
+def _read_time_cell_dynamic(ds: xr.Dataset, var_name: str, n_cells: int) -> np.ndarray:
+    da = ds[var_name]
+    if set(da.dims) == {"time", "cell"}:
+        arr = da.transpose("time", "cell").values.astype(np.float32)
+    elif da.ndim == 1 and da.dims == ("time",):
+        arr = da.values.astype(np.float32)[:, None]
+        arr = np.repeat(arr, repeats=n_cells, axis=1)
+    else:
+        raise ValueError(f"Variable {var_name} has unsupported dims {da.dims}.")
+    return arr
+
+
+def _stack_dynamic_features(ds: xr.Dataset, dynamic_vars: Sequence[str]) -> np.ndarray:
+    _require_vars(ds, dynamic_vars)
+    n_cells = ds.sizes["cell"]
+    arrs = []
+    for v in dynamic_vars:
+        arrs.append(_read_time_cell_dynamic(ds, v, n_cells)[:, :, None])
+    return np.concatenate(arrs, axis=-1).astype(np.float32)
+
+
+def _read_static_var(ds: xr.Dataset, var_name: str) -> np.ndarray:
+    if var_name in ["cell_lat", "lat", "latitude"]:
+        return _read_cell_coord(ds, ["cell_lat", "lat", "latitude"])
+
+    if var_name in ["cell_lon", "lon", "longitude"]:
+        return _read_cell_coord(ds, ["cell_lon", "lon", "longitude"])
+
+    da = ds[var_name]
+    if da.ndim == 1 and da.dims == ("cell",):
+        return da.values.astype(np.float32)
+
+    if set(da.dims) == {"time", "cell"}:
+        arr = da.transpose("time", "cell").values.astype(np.float32)
+        first = arr[0]
+        if not np.allclose(arr, first[None, :], equal_nan=True):
+            raise ValueError(f"{var_name} varies over time, cannot be treated as static.")
+        return first
+
+    raise ValueError(f"Unsupported static dims for {var_name}: {da.dims}")
+
+
+def _stack_static_features(ds: xr.Dataset, static_vars: Sequence[str]) -> np.ndarray:
+    n_cells = ds.sizes["cell"]
+    if not static_vars:
+        return np.zeros((n_cells, 0), dtype=np.float32)
+
+    arrs = []
+    for v in static_vars:
+        arrs.append(_read_static_var(ds, v)[:, None])
+    return np.concatenate(arrs, axis=-1).astype(np.float32)
+
+
+def _month_features_from_times(times: np.ndarray) -> np.ndarray:
+    month = (times.astype("datetime64[M]").astype(int) % 12) + 1
+    month = month.astype(np.float32)
+    month_sin = np.sin(2.0 * np.pi * month / 12.0)
+    month_cos = np.cos(2.0 * np.pi * month / 12.0)
+    return np.stack([month_sin, month_cos], axis=-1).astype(np.float32)
+
+
+def _build_decoder_time_features(target_times: np.ndarray, use_time_features: bool) -> Tuple[np.ndarray, List[str]]:
+    if not use_time_features:
+        return np.zeros((len(target_times), 0), dtype=np.float32), []
+    out = _month_features_from_times(target_times)
+    return out, ["month_sin", "month_cos"]
+
+
+def _make_split_time_mask(time_values: np.ndarray, start: str, end: str) -> np.ndarray:
+    start64 = np.datetime64(start)
+    end64 = np.datetime64(end)
+    return (time_values >= start64) & (time_values <= end64)
+
+
+def _build_windows_for_split_seq2seq(
+    encoder_x_tcf: np.ndarray,        # [T, C, F_enc]
+    target_y_tc: np.ndarray,          # [T, C]
+    decoder_future_tcf: np.ndarray,   # [T, C, F_dec_future]
+    time_values: np.ndarray,          # [T]
+    split_mask_t: np.ndarray,         # [T]
+    lookback: int,
+    horizon: int,
+    decoder_time_features: bool,
+    allow_short_history: bool,
+    encoder_pad_value: float,
+    min_target_time: Optional[str] = None,
+) -> Tuple[torch.Tensor, ...]:
+    T, C, F_enc = encoder_x_tcf.shape
+    assert target_y_tc.shape == (T, C)
+    assert decoder_future_tcf.shape[0] == T and decoder_future_tcf.shape[1] == C
+
+    enc_list = []
+    enc_len_list = []
+    decx_list = []
+    decy_list = []
+    last_obs_list = []
+    target_hist_lp_list = []
+    cellid_list = []
+    target_start_idx_list = []
+
+    start_t = 1 if allow_short_history else lookback
+    min_target_time64 = np.datetime64(min_target_time) if min_target_time is not None else None
+
+    for t in range(start_t, T - horizon + 1):
+        # 핵심: 공정 비교용 target start cutoff
+        if min_target_time64 is not None and time_values[t] < min_target_time64:
+            continue
+
+        if not np.all(split_mask_t[t:t + horizon]):
+            continue
+
+        target_times = time_values[t:t + horizon]
+        dec_time_hf, _ = _build_decoder_time_features(target_times, decoder_time_features)
+
+        hist_start = max(0, t - lookback) if allow_short_history else (t - lookback)
+
+        for c in range(C):
+            hist = encoder_x_tcf[hist_start:t, c, :]     # [L_eff, F_enc]
+            hist_target = target_y_tc[hist_start:t, c]   # [L_eff]
+            decy = target_y_tc[t:t + horizon, c][:, None]
+            dec_future = decoder_future_tcf[t:t + horizon, c, :]
+            decx = np.concatenate([dec_time_hf, dec_future], axis=-1)
+
+            if hist.shape[0] < 1:
+                continue
+            if not np.isfinite(hist).all():
+                continue
+            if not np.isfinite(hist_target).all():
+                continue
+            if not np.isfinite(decy).all():
+                continue
+            if not np.isfinite(decx).all():
+                continue
+
+            hist_len = hist.shape[0]
+
+            # model용 encoder sequence: right-pad
+            enc = np.full((lookback, F_enc), encoder_pad_value, dtype=np.float32)
+            enc[:hist_len, :] = hist
+
+            # baseline용 target history: left-pad
+            target_hist_lp = np.zeros((lookback,), dtype=np.float32)
+            target_hist_lp[-hist_len:] = hist_target
+
+            last_obs_y = np.array([target_y_tc[t - 1, c]], dtype=np.float32)
+
+            enc_list.append(enc)
+            enc_len_list.append(hist_len)
+            decx_list.append(decx)
+            decy_list.append(decy)
+            last_obs_list.append(last_obs_y)
+            target_hist_lp_list.append(target_hist_lp)
+            cellid_list.append(c)
+            target_start_idx_list.append(t)
+
+    if len(enc_list) == 0:
+        raise RuntimeError("No valid windows were built for this split. Check lookback/split/NaN setup.")
+
+    encoder_x = torch.tensor(np.stack(enc_list, axis=0), dtype=torch.float32)
+    encoder_len = torch.tensor(np.asarray(enc_len_list), dtype=torch.long)
+    decoder_x = torch.tensor(np.stack(decx_list, axis=0), dtype=torch.float32)
+    decoder_y = torch.tensor(np.stack(decy_list, axis=0), dtype=torch.float32)
+    last_obs_y = torch.tensor(np.stack(last_obs_list, axis=0), dtype=torch.float32)
+    target_hist_lp = torch.tensor(np.stack(target_hist_lp_list, axis=0), dtype=torch.float32)
+    cell_id = torch.tensor(np.asarray(cellid_list), dtype=torch.long)
+    target_start_idx = torch.tensor(np.asarray(target_start_idx_list), dtype=torch.long)
+
+    return encoder_x, encoder_len, decoder_x, decoder_y, last_obs_y, target_hist_lp, cell_id, target_start_idx
+
+
+def summarize_window_dataset(name: str, ds: WindowDataset, time_values: np.ndarray) -> Dict:
+    idx = ds.target_start_idx.cpu().numpy()
+    lengths = ds.encoder_len.cpu().numpy()
+    start_times = pd.to_datetime(time_values[idx])
+
+    return {
+        "name": name,
+        "n_samples": int(len(ds)),
+        "n_unique_target_starts": int(len(np.unique(idx))),
+        "first_target_time": str(start_times.min().date()) if len(start_times) > 0 else None,
+        "last_target_time": str(start_times.max().date()) if len(start_times) > 0 else None,
+        "encoder_len_min": int(lengths.min()) if len(lengths) > 0 else None,
+        "encoder_len_mean": float(lengths.mean()) if len(lengths) > 0 else None,
+        "encoder_len_max": int(lengths.max()) if len(lengths) > 0 else None,
+    }
+
+
+def prepare_scpdsi_data(
+    ds: xr.Dataset,
+    dynamic_vars: Sequence[str],
+    decoder_future_vars: Sequence[str],
+    static_vars: Sequence[str],
+    append_static_to_encoder: bool,
+    allow_short_history: bool,
+    encoder_pad_value: float,
+    target_var: str = "SC_PDSI_final",
+    lookback: int = 24,
+    horizon: int = 12,
+    split_cfg: SplitConfig = SplitConfig(),
+    decoder_time_features: bool = True,
+    scale_dynamic: bool = True,
+    scale_target: bool = True,
+    min_target_time: Optional[str] = None,
+) -> PreparedData:
+    if target_var not in ds.data_vars:
+        raise KeyError(f"target_var '{target_var}' not found in dataset.")
+
+    if target_var in decoder_future_vars:
+        raise ValueError("target_var must not be included in decoder_future_vars.")
+
+    time_values = ds["time"].values
+    cell_values = ds["cell"].values
+    cell_lat = _read_cell_coord(ds, ["cell_lat", "lat", "latitude"])
+    cell_lon = _read_cell_coord(ds, ["cell_lon", "lon", "longitude"])
+
+    encoder_x_tcf = _stack_dynamic_features(ds, dynamic_vars)
+    static_x_cf = _stack_static_features(ds, static_vars)
+    target_y_tc = ds[target_var].transpose("time", "cell").values.astype(np.float32)
+
+    if len(decoder_future_vars) > 0:
+        decoder_future_tcf = _stack_dynamic_features(ds, decoder_future_vars)
+    else:
+        decoder_future_tcf = np.zeros((len(time_values), len(cell_values), 0), dtype=np.float32)
+
+    train_time_mask = _make_split_time_mask(time_values, split_cfg.train_start, split_cfg.train_end)
+
+    dyn_scaler = PerCellStandardScaler()
+    tgt_scaler = PerCellTargetScaler()
+    static_scaler = StaticFeatureScaler()
+
+    if scale_dynamic:
+        dyn_scaler.fit(encoder_x_tcf, train_time_mask)
+        encoder_x_tcf = dyn_scaler.transform(encoder_x_tcf)
+
+        if decoder_future_tcf.shape[-1] > 0:
+            dec_scaler = PerCellStandardScaler()
+            dec_scaler.fit(decoder_future_tcf, train_time_mask)
+            decoder_future_tcf = dec_scaler.transform(decoder_future_tcf)
+
+    if scale_target:
+        tgt_scaler.fit(target_y_tc, train_time_mask)
+        target_y_tc_scaled = tgt_scaler.transform(target_y_tc)
+    else:
+        tgt_scaler.mean_ = np.zeros(encoder_x_tcf.shape[1], dtype=np.float32)
+        tgt_scaler.std_ = np.ones(encoder_x_tcf.shape[1], dtype=np.float32)
+        target_y_tc_scaled = target_y_tc.copy()
+
+    target_col_idx = list(dynamic_vars).index(target_var) if target_var in dynamic_vars else -1
+    if target_col_idx >= 0:
+        encoder_x_tcf[:, :, target_col_idx] = target_y_tc_scaled
+
+    if append_static_to_encoder and static_x_cf.shape[1] > 0:
+        static_scaler.fit(static_x_cf)
+        static_x_cf = static_scaler.transform(static_x_cf)
+        static_rep_tcf = np.repeat(static_x_cf[None, :, :], repeats=encoder_x_tcf.shape[0], axis=0)
+        encoder_x_tcf = np.concatenate([encoder_x_tcf, static_rep_tcf], axis=-1)
+
+    train_mask = _make_split_time_mask(time_values, split_cfg.train_start, split_cfg.train_end)
+    val_mask   = _make_split_time_mask(time_values, split_cfg.val_start, split_cfg.val_end)
+    test_mask  = _make_split_time_mask(time_values, split_cfg.test_start, split_cfg.test_end)
+
+    train_arrays = _build_windows_for_split_seq2seq(
+        encoder_x_tcf=encoder_x_tcf,
+        target_y_tc=target_y_tc_scaled,
+        decoder_future_tcf=decoder_future_tcf,
+        time_values=time_values,
+        split_mask_t=train_mask,
+        lookback=lookback,
+        horizon=horizon,
+        decoder_time_features=decoder_time_features,
+        allow_short_history=allow_short_history,
+        encoder_pad_value=encoder_pad_value,
+        min_target_time=min_target_time,
+    )
+    val_arrays = _build_windows_for_split_seq2seq(
+        encoder_x_tcf=encoder_x_tcf,
+        target_y_tc=target_y_tc_scaled,
+        decoder_future_tcf=decoder_future_tcf,
+        time_values=time_values,
+        split_mask_t=val_mask,
+        lookback=lookback,
+        horizon=horizon,
+        decoder_time_features=decoder_time_features,
+        allow_short_history=allow_short_history,
+        encoder_pad_value=encoder_pad_value,
+        min_target_time=min_target_time,
+    )
+    test_arrays = _build_windows_for_split_seq2seq(
+        encoder_x_tcf=encoder_x_tcf,
+        target_y_tc=target_y_tc_scaled,
+        decoder_future_tcf=decoder_future_tcf,
+        time_values=time_values,
+        split_mask_t=test_mask,
+        lookback=lookback,
+        horizon=horizon,
+        decoder_time_features=decoder_time_features,
+        allow_short_history=allow_short_history,
+        encoder_pad_value=encoder_pad_value,
+        min_target_time=min_target_time,
+    )
+
+    train_ds = WindowDataset(*train_arrays)
+    val_ds = WindowDataset(*val_arrays)
+    test_ds = WindowDataset(*test_arrays)
+
+    _, time_feature_names = _build_decoder_time_features(time_values[:horizon], decoder_time_features)
+    decoder_feature_names = list(time_feature_names) + list(decoder_future_vars)
+
+    split_window_info = {
+        "train": summarize_window_dataset("train", train_ds, time_values),
+        "val": summarize_window_dataset("val", val_ds, time_values),
+        "test": summarize_window_dataset("test", test_ds, time_values),
+    }
+
+    dynamic_feature_names = list(dynamic_vars)
+    if append_static_to_encoder:
+        dynamic_feature_names += list(static_vars)
+
+    return PreparedData(
+        train=train_ds,
+        val=val_ds,
+        test=test_ds,
+        target_scaler=tgt_scaler,
+        dynamic_feature_names=dynamic_feature_names,
+        decoder_feature_names=decoder_feature_names,
+        target_var=target_var,
+        target_col_idx=target_col_idx,
+        time_values=time_values,
+        cell_values=cell_values,
+        cell_lat=cell_lat,
+        cell_lon=cell_lon,
+        lookback=lookback,
+        horizon=horizon,
+        split_window_info=split_window_info,
+    )
+
+
+
+# 5. MODEL
+
+class Encoder(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, lstm_dropout: float) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.0 if num_layers == 1 else lstm_dropout,
+        )
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        packed = pack_padded_sequence(
+            x,
+            lengths=lengths.detach().cpu(),
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        _, (h_n, c_n) = self.lstm(packed)
+        return h_n, c_n
+
+
+class Decoder(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, lstm_dropout: float, head_dropout: float) -> None:
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.0 if num_layers == 1 else lstm_dropout,
+        )
+        self.head_dropout = nn.Dropout(head_dropout)
+        self.out = nn.Linear(hidden_size, 1)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        dec_out, next_state = self.lstm(x_t, state)
+        y_hat = self.out(self.head_dropout(dec_out[:, 0, :]))
+        return y_hat, next_state
+
+
+class EDLSTM(nn.Module):
+    """
+    autoregressive encoder-decoder LSTM
+    decoder input = [prev_y, decoder_known_inputs_t]
+    """
+    def __init__(
+        self,
+        enc_input_size: int,
+        dec_input_size: int,
+        target_col_idx: int,
+        target_mode: str,
+        hidden_size: int = 128,
+        num_layers: int = 1,
+        lstm_dropout: float = 0.0,
+        encoder_input_dropout: float = 0.0,
+        decoder_input_dropout: float = 0.0,
+        head_dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if target_col_idx < 0:
+            raise ValueError("target_col_idx must be >= 0.")
+
+        self.target_col_idx = target_col_idx
+        self.target_mode = target_mode
+
+        self.encoder_input_dropout = nn.Dropout(encoder_input_dropout)
+        self.decoder_input_dropout = nn.Dropout(decoder_input_dropout)
+
+        self.encoder = Encoder(
+            input_size=enc_input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            lstm_dropout=lstm_dropout,
+        )
+
+        self.decoder = Decoder(
+            input_size=1 + dec_input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            lstm_dropout=lstm_dropout,
+            head_dropout=head_dropout,
+        )
+
+    def forward(
+        self,
+        encoder_x: torch.Tensor,
+        encoder_len: torch.Tensor,
+        last_obs_y: torch.Tensor,
+        decoder_x: torch.Tensor,
+        decoder_y: Optional[torch.Tensor] = None,
+        teacher_forcing_ratio: float = 0.0,
+    ) -> torch.Tensor:
+        horizon = decoder_x.size(1)
+        device = encoder_x.device
+
+        enc_in = self.encoder_input_dropout(encoder_x)
+        h_n, c_n = self.encoder(enc_in, encoder_len)
+        state = (h_n, c_n)
+
+        prev_y = last_obs_y  # [B,1]
+        preds = []
+
+        for t in range(horizon):
+            dec_x_t = decoder_x[:, t, :]  # [B,F_dec]
+            step_input = torch.cat([prev_y, dec_x_t], dim=-1)
+            step_input = self.decoder_input_dropout(step_input).unsqueeze(1)
+
+            y_hat, state = self.decoder(step_input, state)
+            preds.append(y_hat.unsqueeze(1))
+
+            use_tf = (
+                self.training
+                and decoder_y is not None
+                and teacher_forcing_ratio > 0.0
+                and (torch.rand(1, device=device).item() < teacher_forcing_ratio)
+            )
+            prev_y = decoder_y[:, t, :] if use_tf else y_hat
+
+        return torch.cat(preds, dim=1)  # [B,H,1]
+
+
+
+# 6. LOSS / TRAIN / PREDICT
+
+def teacher_forcing_schedule(epoch: int, max_epochs: int, start: float, end: float) -> float:
+    if max_epochs <= 1:
+        return end
+    frac = epoch / float(max_epochs - 1)
+    return start + (end - start) * frac
+
+
+def _expand_base_from_last_obs(last_obs_y: torch.Tensor, horizon: int) -> torch.Tensor:
+    return last_obs_y.unsqueeze(1).expand(-1, horizon, -1)
+
+
+def make_training_target(
+    decoder_y: torch.Tensor,
+    last_obs_y: torch.Tensor,
+    target_mode: str,
+) -> torch.Tensor:
+    if target_mode == "absolute":
+        return decoder_y
+
+    if target_mode == "residual_from_last":
+        base = _expand_base_from_last_obs(last_obs_y, decoder_y.size(1))
+        return decoder_y - base
+
+    raise ValueError(f"Unsupported target_mode: {target_mode}")
+
+
+def recover_absolute_prediction(
+    pred_model: torch.Tensor,
+    last_obs_y: torch.Tensor,
+    target_mode: str,
+) -> torch.Tensor:
+    if target_mode == "absolute":
+        return pred_model
+
+    if target_mode == "residual_from_last":
+        base = _expand_base_from_last_obs(last_obs_y, pred_model.size(1))
+        return pred_model + base
+
+    raise ValueError(f"Unsupported target_mode: {target_mode}")
+
+
+def compute_seq_loss(pred: torch.Tensor, target: torch.Tensor, mode: str) -> torch.Tensor:
+    if mode == "full":
+        return torch.mean((pred - target) ** 2)
+
+    if mode == "hlast_only":
+        return torch.mean((pred[:, -1:, :] - target[:, -1:, :]) ** 2)
+
+    if mode == "linear_hlast_weighted":
+        h = pred.size(1)
+        w = torch.linspace(1.0 / h, 1.0, h, device=pred.device).view(1, h, 1)
+        w = w / w.mean()
+        return torch.mean(((pred - target) ** 2) * w)
+
+    raise ValueError(f"Unsupported loss_mode: {mode}")
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    teacher_forcing_ratio: float,
+    loss_mode: str,
+    max_grad_norm: float,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    n_samples = 0
+
+    for batch in loader:
+        enc = batch["encoder_x"].to(device)
+        enc_len = batch["encoder_len"].to(device)
+        dec_x = batch["decoder_x"].to(device)
+        dec_y = batch["decoder_y"].to(device)
+        last_obs_y = batch["last_obs_y"].to(device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        pred_model = model(
+            encoder_x=enc,
+            encoder_len=enc_len,
+            last_obs_y=last_obs_y,
+            decoder_x=dec_x,
+            decoder_y=dec_y,
+            teacher_forcing_ratio=teacher_forcing_ratio,
+        )
+
+        train_target = make_training_target(
+            decoder_y=dec_y,
+            last_obs_y=last_obs_y,
+            target_mode=model.target_mode,
+        )
+
+        loss = compute_seq_loss(pred_model, train_target, mode=loss_mode)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+
+        bs = enc.size(0)
+        total_loss += loss.item() * bs
+        n_samples += bs
+
+    return total_loss / max(n_samples, 1)
+
+
+@torch.no_grad()
+def evaluate_loss(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    loss_mode: str,
+) -> float:
+    model.eval()
+    total_loss = 0.0
+    n_samples = 0
+
+    for batch in loader:
+        enc = batch["encoder_x"].to(device)
+        enc_len = batch["encoder_len"].to(device)
+        dec_x = batch["decoder_x"].to(device)
+        dec_y = batch["decoder_y"].to(device)
+        last_obs_y = batch["last_obs_y"].to(device)
+
+        pred_model = model(
+            encoder_x=enc,
+            encoder_len=enc_len,
+            last_obs_y=last_obs_y,
+            decoder_x=dec_x,
+            decoder_y=None,
+            teacher_forcing_ratio=0.0,
+        )
+
+        eval_target = make_training_target(
+            decoder_y=dec_y,
+            last_obs_y=last_obs_y,
+            target_mode=model.target_mode,
+        )
+
+        loss = compute_seq_loss(pred_model, eval_target, mode=loss_mode)
+
+        bs = enc.size(0)
+        total_loss += loss.item() * bs
+        n_samples += bs
+
+    return total_loss / max(n_samples, 1)
+
+
+@torch.no_grad()
+def predict_loader(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, torch.Tensor]:
+    model.eval()
+    preds, tgts, cids = [], [], []
+
+    for batch in loader:
+        enc = batch["encoder_x"].to(device)
+        enc_len = batch["encoder_len"].to(device)
+        dec_x = batch["decoder_x"].to(device)
+        dec_y = batch["decoder_y"].to(device)
+        last_obs_y = batch["last_obs_y"].to(device)
+        cell_id = batch["cell_id"].to(device)
+
+        pred_model = model(
+            encoder_x=enc,
+            encoder_len=enc_len,
+            last_obs_y=last_obs_y,
+            decoder_x=dec_x,
+            decoder_y=None,
+            teacher_forcing_ratio=0.0,
+        )
+
+        pred_abs = recover_absolute_prediction(
+            pred_model=pred_model,
+            last_obs_y=last_obs_y,
+            target_mode=model.target_mode,
+        )
+
+        preds.append(pred_abs.cpu())
+        tgts.append(dec_y.cpu())
+        cids.append(cell_id.cpu())
+
+    return {
+        "pred": torch.cat(preds, dim=0),
+        "target": torch.cat(tgts, dim=0),
+        "cell_id": torch.cat(cids, dim=0),
+    }
+
+
+
+# 7. METRICS / BASELINES
+
+def inverse_pred_pack(pred_pack: Dict[str, torch.Tensor], prepared: PreparedData) -> Dict[str, torch.Tensor]:
+    pred = pred_pack["pred"].clone()
+    target = pred_pack["target"].clone()
+    cell_id = pred_pack["cell_id"].clone()
+    scaler = prepared.target_scaler
+
+    pred = scaler.inverse_transform_batch_torch(pred, cell_id)
+    target = scaler.inverse_transform_batch_torch(target, cell_id)
+
+    return {"pred": pred, "target": target, "cell_id": cell_id}
+
+
+def pooled_r2_np(pred: np.ndarray, target: np.ndarray) -> float:
+    pred = pred.reshape(-1).astype(float)
+    target = target.reshape(-1).astype(float)
+    ss_res = np.sum((target - pred) ** 2)
+    ss_tot = np.sum((target - target.mean()) ** 2)
+    if ss_tot <= 0:
+        return float("nan")
+    return float(1.0 - ss_res / ss_tot)
+
+
+def rmse_np(pred: np.ndarray, target: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((target - pred) ** 2)))
+
+
+def mae_np(pred: np.ndarray, target: np.ndarray) -> float:
+    return float(np.mean(np.abs(target - pred)))
+
+
+def overall_metrics_from_pack(pred_pack: Dict[str, torch.Tensor], hlast_only: bool = True) -> Dict[str, float]:
+    idx = -1 if hlast_only else 0
+    pred = pred_pack["pred"][:, idx, 0].cpu().numpy()
+    target = pred_pack["target"][:, idx, 0].cpu().numpy()
+    return {
+        "pooled_r2": pooled_r2_np(pred, target),
+        "rmse": rmse_np(pred, target),
+        "mae": mae_np(pred, target),
+        "n_samples": int(pred.shape[0]),
+    }
+
+
+def per_cell_metrics_from_pack(
+    pred_pack: Dict[str, torch.Tensor],
+    cell_values: np.ndarray,
+    cell_lat: np.ndarray,
+    cell_lon: np.ndarray,
+    hlast_only: bool = True,
+) -> pd.DataFrame:
+    idx = -1 if hlast_only else 0
+    pred = pred_pack["pred"][:, idx, 0].cpu().numpy()
+    target = pred_pack["target"][:, idx, 0].cpu().numpy()
+    cell_id = pred_pack["cell_id"].cpu().numpy()
+
+    rows = []
+    for cid in np.unique(cell_id):
+        mask = cell_id == cid
+        y = target[mask]
+        p = pred[mask]
+
+        ss_tot = np.sum((y - y.mean()) ** 2)
+        r2 = np.nan if ss_tot <= 0 else 1.0 - np.sum((y - p) ** 2) / ss_tot
+
+        rows.append({
+            "cell_id": int(cid),
+            "cell_value": int(cell_values[int(cid)]) if int(cid) < len(cell_values) else int(cid),
+            "cell_lat": float(cell_lat[int(cid)]),
+            "cell_lon": float(cell_lon[int(cid)]),
+            "n_samples": int(mask.sum()),
+            "mean_obs": float(np.mean(y)),
+            "std_obs": float(np.std(y, ddof=0)),
+            "mean_pred": float(np.mean(p)),
+            "std_pred": float(np.std(p, ddof=0)),
+            "r2": float(r2) if not np.isnan(r2) else np.nan,
+            "rmse": rmse_np(p, y),
+            "mae": mae_np(p, y),
+        })
+
+    return pd.DataFrame(rows).sort_values("cell_id").reset_index(drop=True)
+
+
+def summarize_distribution(df: pd.DataFrame, metric_col: str) -> Dict[str, float]:
+    vals = df[metric_col].dropna().to_numpy()
+    if vals.size == 0:
+        return {"mean": np.nan, "std": np.nan, "median": np.nan, "q1": np.nan, "q3": np.nan}
+    return {
+        "mean": float(np.mean(vals)),
+        "std": float(np.std(vals, ddof=0)),
+        "median": float(np.median(vals)),
+        "q1": float(np.quantile(vals, 0.25)),
+        "q3": float(np.quantile(vals, 0.75)),
+    }
+
+
+def build_pred_pack_from_scaled_arrays(
+    pred_scaled_nh1: torch.Tensor,
+    target_scaled_nh1: torch.Tensor,
+    cell_id_n: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    return {
+        "pred": pred_scaled_nh1.clone(),
+        "target": target_scaled_nh1.clone(),
+        "cell_id": cell_id_n.clone(),
+    }
+
+
+def persistence_baseline_pred_pack(dataset: WindowDataset) -> Dict[str, torch.Tensor]:
+    tgt = dataset.decoder_y
+    cid = dataset.cell_id
+    last_scaled = dataset.last_obs_y  # [N,1]
+    pred_scaled = last_scaled.unsqueeze(1).expand(-1, tgt.size(1), -1).contiguous()
+    return build_pred_pack_from_scaled_arrays(pred_scaled, tgt, cid)
+
+
+def fit_ridge_target_history(
+    train_dataset: WindowDataset,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    X = train_dataset.target_hist_lp.cpu().numpy()     # [N, L]
+    y = train_dataset.decoder_y[:, -1, 0].cpu().numpy()
+
+    X_aug = np.concatenate([X, np.ones((X.shape[0], 1), dtype=X.dtype)], axis=1)
+
+    I = np.eye(X_aug.shape[1], dtype=np.float32)
+    I[-1, -1] = 0.0
+
+    w = np.linalg.solve(X_aug.T @ X_aug + alpha * I, X_aug.T @ y)
+    return w.astype(np.float32)
+
+
+def ridge_target_history_pred_pack(
+    dataset: WindowDataset,
+    ridge_w: np.ndarray,
+) -> Dict[str, torch.Tensor]:
+    X = dataset.target_hist_lp.cpu().numpy()
+    X_aug = np.concatenate([X, np.ones((X.shape[0], 1), dtype=X.dtype)], axis=1)
+    yhat_last = X_aug @ ridge_w
+
+    H = dataset.decoder_y.size(1)
+    pred_scaled = np.repeat(yhat_last[:, None, None], repeats=H, axis=1).astype(np.float32)
+
+    return build_pred_pack_from_scaled_arrays(
+        pred_scaled_nh1=torch.tensor(pred_scaled),
+        target_scaled_nh1=dataset.decoder_y,
+        cell_id_n=dataset.cell_id,
+    )
+
+
+@torch.no_grad()
+def evaluate_split_grid_summary(
+    model: nn.Module,
+    dataset: WindowDataset,
+    prepared: PreparedData,
+    batch_size: int,
+    device: torch.device,
+) -> Dict[str, float]:
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    pred_pack_scaled = predict_loader(model, loader, device)
+    pred_pack = inverse_pred_pack(pred_pack_scaled, prepared)
+
+    df = per_cell_metrics_from_pack(
+        pred_pack=pred_pack,
+        cell_values=prepared.cell_values,
+        cell_lat=prepared.cell_lat,
+        cell_lon=prepared.cell_lon,
+        hlast_only=True,
+    )
+
+    return {
+        "grid_r2_mean": float(df["r2"].mean()),
+        "grid_r2_median": float(df["r2"].median()),
+        "grid_rmse_mean": float(df["rmse"].mean()),
+        "grid_mae_mean": float(df["mae"].mean()),
+    }
+
+
+
+# 8. PLOTS
+
+def save_learning_curve(history_df: pd.DataFrame, out_png: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(history_df["epoch"], history_df["train_loss"], label="train_loss")
+    ax.plot(history_df["epoch"], history_df["val_loss"], label="val_loss")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("loss")
+    ax.set_title("Learning curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_selection_curve(history_df: pd.DataFrame, out_png: Path) -> None:
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(history_df["epoch"], history_df["val_grid_r2_mean"], marker="o", label="val_grid_r2_mean")
+    ax.plot(history_df["epoch"], history_df["val_grid_r2_median"], marker="o", label="val_grid_r2_median")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("grid-wise R2")
+    ax.set_title("Validation h-last grid-wise R2")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_grid_metric_map(
+    df: pd.DataFrame,
+    metric_col: str,
+    out_png: Path,
+    title: str,
+) -> None:
+    if metric_col == "r2":
+        cmap = "RdBu_r"
+        vmin, vmax = -1.0, 1.0
+    else:
+        cmap = "viridis"
+        vmin = 0.0
+        vmax = np.nanquantile(df[metric_col].to_numpy(), 0.95) if len(df) > 0 else 1.0
+        if not np.isfinite(vmax) or vmax <= 0:
+            vmax = 1.0
+
+    fig, ax = plt.subplots(figsize=(6, 7))
+    sc = ax.scatter(
+        df["cell_lon"],
+        df["cell_lat"],
+        c=df[metric_col],
+        cmap=cmap,
+        s=260,
+        marker="s",
+        edgecolor="k",
+        linewidth=0.25,
+        vmin=vmin,
+        vmax=vmax,
+    )
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(title)
+    ax.set_aspect("equal")
+    ax.grid(True, alpha=0.2)
+    cbar = plt.colorbar(sc, ax=ax, shrink=0.85)
+    cbar.set_label(metric_col)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+
+# 9. MODEL BUILD / FIT
+
+def build_model(prepared: PreparedData, cfg: Dict) -> nn.Module:
+    enc_input_size = prepared.train.encoder_x.shape[-1]
+    dec_input_size = prepared.train.decoder_x.shape[-1]
+
+    model = EDLSTM(
+        enc_input_size=enc_input_size,
+        dec_input_size=dec_input_size,
+        target_col_idx=prepared.target_col_idx,
+        target_mode=str(cfg["target_mode"]),
+        hidden_size=int(cfg["hidden_size"]),
+        num_layers=int(cfg["num_layers"]),
+        lstm_dropout=float(cfg["lstm_dropout"]),
+        encoder_input_dropout=float(cfg["encoder_input_dropout"]),
+        decoder_input_dropout=float(cfg["decoder_input_dropout"]),
+        head_dropout=float(cfg["head_dropout"]),
+    )
+    return model
+
+
+def fit_model(
+    prepared: PreparedData,
+    cfg: Dict,
+    device: torch.device,
+    out_dir: Path,
+) -> Tuple[nn.Module, pd.DataFrame]:
+    train_loader = DataLoader(prepared.train, batch_size=int(cfg["batch_size"]), shuffle=True, num_workers=0)
+    val_loader = DataLoader(prepared.val, batch_size=int(cfg["batch_size"]), shuffle=False, num_workers=0)
+
+    model = build_model(prepared, cfg).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(cfg["lr"]),
+        weight_decay=float(cfg["weight_decay"]),
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=float(cfg["scheduler_factor"]),
+        patience=int(cfg["scheduler_patience"]),
+        min_lr=float(cfg["min_lr"]),
+    )
+
+    best_score = -np.inf
+    best_state = None
+    bad_epochs = 0
+    history_rows = []
+
+    for epoch in range(int(cfg["max_epochs"])):
+        tf_ratio = teacher_forcing_schedule(
+            epoch=epoch,
+            max_epochs=int(cfg["max_epochs"]),
+            start=float(cfg["tf_start"]),
+            end=float(cfg["tf_end"]),
+        )
+
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            teacher_forcing_ratio=tf_ratio,
+            loss_mode=str(cfg["loss_mode"]),
+            max_grad_norm=float(cfg["max_grad_norm"]),
+        )
+
+        val_loss = evaluate_loss(
+            model=model,
+            loader=val_loader,
+            device=device,
+            loss_mode=str(cfg["loss_mode"]),
+        )
+
+        val_grid = evaluate_split_grid_summary(
+            model=model,
+            dataset=prepared.val,
+            prepared=prepared,
+            batch_size=int(cfg["batch_size"]),
+            device=device,
+        )
+
+        history_rows.append({
+            "epoch": epoch + 1,
+            "lr": optimizer.param_groups[0]["lr"],
+            "teacher_forcing_ratio": tf_ratio,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_grid_r2_mean": val_grid["grid_r2_mean"],
+            "val_grid_r2_median": val_grid["grid_r2_median"],
+            "val_grid_rmse_mean": val_grid["grid_rmse_mean"],
+            "val_grid_mae_mean": val_grid["grid_mae_mean"],
+        })
+
+        score = val_grid["grid_r2_median"]
+        if np.isnan(score):
+            score = -np.inf
+
+        scheduler.step(score)
+
+        if best_state is None or score > best_score:
+            best_score = score
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+
+        if bad_epochs >= int(cfg["patience"]):
+            break
+
+    history_df = pd.DataFrame(history_rows)
+    history_df.to_csv(out_dir / "train_history.csv", index=False)
+    save_learning_curve(history_df, out_dir / "learning_curve.png")
+    save_selection_curve(history_df, out_dir / "selection_curve.png")
+
+    if best_state is None:
+        raise RuntimeError("No best model state captured.")
+
+    model.load_state_dict(best_state)
+    torch.save(best_state, out_dir / "best_model.pt")
+    return model, history_df
+
+
+def fit_model_fixed_epochs(
+    prepared: PreparedData,
+    cfg: Dict,
+    device: torch.device,
+    out_dir: Path,
+    n_epochs: int,
+) -> nn.Module:
+    train_loader = DataLoader(prepared.train, batch_size=int(cfg["batch_size"]), shuffle=True, num_workers=0)
+
+    model = build_model(prepared, cfg).to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=float(cfg["lr"]),
+        weight_decay=float(cfg["weight_decay"]),
+    )
+
+    rows = []
+    for epoch in range(int(n_epochs)):
+        tf_ratio = teacher_forcing_schedule(
+            epoch=epoch,
+            max_epochs=max(int(n_epochs), 1),
+            start=float(cfg["tf_start"]),
+            end=float(cfg["tf_end"]),
+        )
+
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            teacher_forcing_ratio=tf_ratio,
+            loss_mode=str(cfg["loss_mode"]),
+            max_grad_norm=float(cfg["max_grad_norm"]),
+        )
+
+        rows.append({
+            "epoch": epoch + 1,
+            "teacher_forcing_ratio": tf_ratio,
+            "train_loss": train_loss,
+        })
+
+    pd.DataFrame(rows).to_csv(out_dir / "refit_train_history.csv", index=False)
+    torch.save(model.state_dict(), out_dir / "best_model.pt")
+    return model
+
+
+
+# 10. EXPERIMENT
+
+def save_json(obj: Dict, path: Path) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def evaluate_and_save_baseline_pack(
+    pred_pack_scaled: Dict[str, torch.Tensor],
+    prepared: PreparedData,
+    lead_dir: Path,
+    split_name: str,
+    baseline_name: str,
+    lead: int,
+) -> pd.DataFrame:
+    pred_pack = inverse_pred_pack(pred_pack_scaled, prepared)
+
+    grid_df = per_cell_metrics_from_pack(
+        pred_pack=pred_pack,
+        cell_values=prepared.cell_values,
+        cell_lat=prepared.cell_lat,
+        cell_lon=prepared.cell_lon,
+        hlast_only=True,
+    )
+    grid_df.insert(0, "split", split_name)
+    grid_df.insert(0, "lead", lead)
+    grid_df.insert(0, "baseline", baseline_name)
+    grid_df.to_csv(lead_dir / f"{baseline_name}_{split_name}_grid_metrics_hlast.csv", index=False)
+
+    save_grid_metric_map(
+        grid_df, "r2",
+        lead_dir / f"map_{baseline_name}_{split_name}_r2_lead{lead:02d}.png",
+        f"{baseline_name} {split_name} grid-wise R2 (lead={lead})",
+    )
+    save_grid_metric_map(
+        grid_df, "rmse",
+        lead_dir / f"map_{baseline_name}_{split_name}_rmse_lead{lead:02d}.png",
+        f"{baseline_name} {split_name} grid-wise RMSE (lead={lead})",
+    )
+    save_grid_metric_map(
+        grid_df, "mae",
+        lead_dir / f"map_{baseline_name}_{split_name}_mae_lead{lead:02d}.png",
+        f"{baseline_name} {split_name} grid-wise MAE (lead={lead})",
+    )
+
+    return grid_df
+
+
+def run_single_lead_experiment(
+    ds: xr.Dataset,
+    base_cfg: Dict,
+    lead: int,
+    device: torch.device,
+    root_out_dir: Path,
+) -> None:
+    lead_dir = root_out_dir / f"lead_{lead:02d}"
+    lead_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) selection split
+    selection_split = SplitConfig(**base_cfg["selection_split"])
+    prepared_sel = prepare_scpdsi_data(
+        ds=ds,
+        dynamic_vars=base_cfg["dynamic_vars"],
+        decoder_future_vars=base_cfg["decoder_future_vars"],
+        static_vars=base_cfg["static_vars"],
+        append_static_to_encoder=bool(base_cfg["append_static_to_encoder"]),
+        allow_short_history=bool(base_cfg["allow_short_history"]),
+        encoder_pad_value=float(base_cfg["encoder_pad_value"]),
+        target_var=base_cfg["target_var"],
+        lookback=int(base_cfg["lookback"]),
+        horizon=int(lead),
+        split_cfg=selection_split,
+        decoder_time_features=bool(base_cfg["decoder_time_features"]),
+        scale_dynamic=bool(base_cfg["scale_dynamic"]),
+        scale_target=bool(base_cfg["scale_target"]),
+        min_target_time=(base_cfg["min_target_time"])
+    )
+
+    save_json(prepared_sel.split_window_info, lead_dir / "selection_window_info.json")
+
+    selection_dir = lead_dir / "selection"
+    selection_dir.mkdir(parents=True, exist_ok=True)
+
+    model_sel, history_df = fit_model(prepared_sel, base_cfg, device, selection_dir)
+    best_epoch = int(history_df.loc[history_df["val_grid_r2_median"].idxmax(), "epoch"])
+
+    save_json({
+        "lead": lead,
+        "best_epoch": best_epoch,
+        "selection_best_val_grid_r2_median": float(history_df["val_grid_r2_median"].max()),
+    }, lead_dir / "selection_info.json")
+
+    # selection train/val save
+    for split_name, dataset in {"train": prepared_sel.train, "val": prepared_sel.val}.items():
+        loader = DataLoader(dataset, batch_size=int(base_cfg["batch_size"]), shuffle=False, num_workers=0)
+        pred_pack_scaled = predict_loader(model_sel, loader, device)
+        pred_pack = inverse_pred_pack(pred_pack_scaled, prepared_sel)
+
+        grid_df = per_cell_metrics_from_pack(
+            pred_pack=pred_pack,
+            cell_values=prepared_sel.cell_values,
+            cell_lat=prepared_sel.cell_lat,
+            cell_lon=prepared_sel.cell_lon,
+            hlast_only=True,
+        )
+        grid_df.insert(0, "split", split_name)
+        grid_df.insert(0, "lead", lead)
+        grid_df.to_csv(selection_dir / f"{split_name}_grid_metrics_hlast.csv", index=False)
+
+        save_grid_metric_map(
+            grid_df, "r2",
+            selection_dir / f"map_{split_name}_r2_lead{lead:02d}.png",
+            f"selection {split_name} grid-wise R2 (lead={lead})",
+        )
+
+    # 2) report split
+    report_split = SplitConfig(**base_cfg["report_split"])
+    prepared_rep = prepare_scpdsi_data(
+        ds=ds,
+        dynamic_vars=base_cfg["dynamic_vars"],
+        decoder_future_vars=base_cfg["decoder_future_vars"],
+        static_vars=base_cfg["static_vars"],
+        append_static_to_encoder=bool(base_cfg["append_static_to_encoder"]),
+        allow_short_history=bool(base_cfg["allow_short_history"]),
+        encoder_pad_value=float(base_cfg["encoder_pad_value"]),
+        target_var=base_cfg["target_var"],
+        lookback=int(base_cfg["lookback"]),
+        horizon=int(lead),
+        split_cfg=report_split,
+        decoder_time_features=bool(base_cfg["decoder_time_features"]),
+        scale_dynamic=bool(base_cfg["scale_dynamic"]),
+        scale_target=bool(base_cfg["scale_target"]),
+        min_target_time=(base_cfg["min_target_time"])
+    )
+
+    save_json(prepared_rep.split_window_info, lead_dir / "report_window_info.json")
+
+    refit_dir = lead_dir / "refit"
+    refit_dir.mkdir(parents=True, exist_ok=True)
+
+    model = fit_model_fixed_epochs(
+        prepared=prepared_rep,
+        cfg=base_cfg,
+        device=device,
+        out_dir=refit_dir,
+        n_epochs=best_epoch,
+    )
+
+    # 3) final evaluation
+    split_map = {
+        "train": prepared_rep.train,
+        "val": prepared_rep.val,
+        "test": prepared_rep.test,
+    }
+
+    overall_rows = []
+    all_split_grid_df = []
+
+    for split_name, dataset in split_map.items():
+        loader = DataLoader(dataset, batch_size=int(base_cfg["batch_size"]), shuffle=False, num_workers=0)
+        pred_pack_scaled = predict_loader(model, loader, device)
+        pred_pack = inverse_pred_pack(pred_pack_scaled, prepared_rep)
+        torch.save(pred_pack, lead_dir / f"{split_name}_pred_pack_original_scale.pt")
+
+        overall = overall_metrics_from_pack(pred_pack, hlast_only=True)
+        overall["split"] = split_name
+        overall["lead"] = lead
+        overall_rows.append(overall)
+
+        grid_df = per_cell_metrics_from_pack(
+            pred_pack=pred_pack,
+            cell_values=prepared_rep.cell_values,
+            cell_lat=prepared_rep.cell_lat,
+            cell_lon=prepared_rep.cell_lon,
+            hlast_only=True,
+        )
+        grid_df.insert(0, "split", split_name)
+        grid_df.insert(0, "lead", lead)
+        grid_df.to_csv(lead_dir / f"{split_name}_grid_metrics_hlast.csv", index=False)
+        all_split_grid_df.append(grid_df)
+
+        if split_name in base_cfg["save_maps_for_splits"]:
+            save_grid_metric_map(
+                grid_df, "r2",
+                lead_dir / f"map_{split_name}_r2_lead{lead:02d}.png",
+                f"{split_name} grid-wise R2 (lead={lead})",
+            )
+            save_grid_metric_map(
+                grid_df, "rmse",
+                lead_dir / f"map_{split_name}_rmse_lead{lead:02d}.png",
+                f"{split_name} grid-wise RMSE (lead={lead})",
+            )
+            save_grid_metric_map(
+                grid_df, "mae",
+                lead_dir / f"map_{split_name}_mae_lead{lead:02d}.png",
+                f"{split_name} grid-wise MAE (lead={lead})",
+            )
+
+    overall_df = pd.DataFrame(overall_rows)
+    overall_df.to_csv(lead_dir / "overall_metrics_hlast.csv", index=False)
+
+    grid_all_df = pd.concat(all_split_grid_df, axis=0, ignore_index=True)
+    grid_all_df.to_csv(lead_dir / "grid_metrics_all_splits_hlast.csv", index=False)
+
+    # split summaries
+    summary_rows = []
+    for split_name in ["train", "val", "test"]:
+        df_split = grid_all_df[grid_all_df["split"] == split_name].copy()
+        for metric in ["r2", "rmse", "mae"]:
+            row = summarize_distribution(df_split, metric)
+            row.update({"lead": lead, "split": split_name, "metric": metric})
+            summary_rows.append(row)
+    pd.DataFrame(summary_rows).to_csv(lead_dir / "split_grid_distribution_summary.csv", index=False)
+
+    # baselines
+    ridge_w = fit_ridge_target_history(
+        train_dataset=prepared_rep.train,
+        alpha=float(base_cfg["baseline_ridge_alpha"]),
+    )
+
+    baseline_rows = []
+    for split_name, dataset in split_map.items():
+        pack_persistence = persistence_baseline_pred_pack(dataset)
+        df_persistence = evaluate_and_save_baseline_pack(
+            pred_pack_scaled=pack_persistence,
+            prepared=prepared_rep,
+            lead_dir=lead_dir,
+            split_name=split_name,
+            baseline_name="baseline_persistence",
+            lead=lead,
+        )
+
+        pack_ridge = ridge_target_history_pred_pack(dataset, ridge_w=ridge_w)
+        df_ridge = evaluate_and_save_baseline_pack(
+            pred_pack_scaled=pack_ridge,
+            prepared=prepared_rep,
+            lead_dir=lead_dir,
+            split_name=split_name,
+            baseline_name="baseline_ridge_target_history",
+            lead=lead,
+        )
+
+        for baseline_name, df in [
+            ("baseline_persistence", df_persistence),
+            ("baseline_ridge_target_history", df_ridge),
+        ]:
+            for metric in ["r2", "rmse", "mae"]:
+                row = summarize_distribution(df, metric)
+                row.update({
+                    "lead": lead,
+                    "split": split_name,
+                    "baseline": baseline_name,
+                    "metric": metric,
+                })
+                baseline_rows.append(row)
+
+    pd.DataFrame(baseline_rows).to_csv(lead_dir / "baseline_distribution_summary.csv", index=False)
+
+
+# 11. MAIN
+
+def run_all_leads_experiment(cfg: Dict) -> None:
+    seed_everything(int(cfg["seed"]))
+    device = get_device(cfg["device"])
+
+    root_out_dir = Path(cfg["out_dir"])
+    root_out_dir.mkdir(parents=True, exist_ok=True)
+
+    ds = open_and_merge_datasets(cfg["nc_path"], cfg["extra_nc_paths"])
+    ds = maybe_add_derived_features(ds, cfg)
+
+    run_cfg_to_save = copy.deepcopy(cfg)
+    run_cfg_to_save["device_resolved"] = str(device)
+    save_json(run_cfg_to_save, root_out_dir / "run_config.json")
+
+    for lead in cfg["leads"]:
+        print(f"\n[INFO] Running lead={lead}")
+        run_single_lead_experiment(
+            ds=ds,
+            base_cfg=cfg,
+            lead=int(lead),
+            device=device,
+            root_out_dir=root_out_dir,
+        )
+
+    print("\n[INFO] Finished.")
+    print(f"[INFO] Outputs saved to: {root_out_dir}")
+
+
+if __name__ == "__main__":
+    run_all_leads_experiment(CONFIG)
